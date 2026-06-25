@@ -10,6 +10,7 @@ pub(crate) const BOOST_BPS_BASE: u32 = 10_000;
 pub(crate) const MAX_BOOST_TIERS: u32 = 5;
 pub(crate) const MAX_HISTORY_SNAPSHOTS: u32 = 100;
 pub(crate) const STELLAR_LEDGERS_PER_YEAR: u32 = 6_307_200;
+pub(crate) const MAX_UNSTAKE_FEE_BPS: u32 = 500;
 
 #[contract]
 pub struct VaultContract;
@@ -17,7 +18,19 @@ pub struct VaultContract;
 #[contractimpl]
 impl VaultContract {
     /// Initialize the vault with an admin and the token it accepts.
-    pub fn initialize(env: Env, admin: Address, token: Address) -> Result<(), VaultError> {
+    ///
+    /// `stake_decimals` and `reward_decimals` declare the decimal precision of
+    /// the stake and reward tokens so reward amounts can be normalized when the
+    /// two tokens differ. Both are optional and default to 7 (the Stellar
+    /// standard) when `None` is passed, keeping pools initialized without
+    /// explicit decimals backward compatible.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        token: Address,
+        stake_decimals: Option<u32>,
+        reward_decimals: Option<u32>,
+    ) -> Result<(), VaultError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(VaultError::AlreadyInitialized);
         }
@@ -27,6 +40,19 @@ impl VaultContract {
         env.storage().instance().set(&DataKey::Paused, &false);
         // By default, set the slash treasury to the admin address. Can be updated by admin later.
         env.storage().instance().set(&DataKey::SlashTreasury, &admin);
+
+        // Persist token decimals so reward math can normalize across mismatched
+        // precisions. Unspecified values fall back to the Stellar standard of 7.
+        balance::set_stake_decimals(
+            &env,
+            stake_decimals.unwrap_or(balance::DEFAULT_TOKEN_DECIMALS),
+        );
+        balance::set_reward_decimals(
+            &env,
+            reward_decimals.unwrap_or(balance::DEFAULT_TOKEN_DECIMALS),
+        );
+
+        events::pool_initialized(&env, &admin, &token, &token, 0);
         Ok(())
     }
 
@@ -126,6 +152,42 @@ impl VaultContract {
         Self::build_position(&env, &user)
     }
 
+    /// Returns positions for a list of addresses in a single contract call.
+    ///
+    /// Results are returned in the same order as the input list. `None` is returned
+    /// for users with no active position — the call never reverts on a missing user.
+    /// Reverts with `BatchTooLarge` when more than 20 addresses are supplied to prevent
+    /// excessive compute costs per invocation. No auth required.
+    pub fn batch_position_query(
+        env: Env,
+        users: Vec<Address>,
+    ) -> Result<Vec<Option<StakePosition>>, VaultError> {
+        if users.len() > 20 {
+            return Err(VaultError::BatchTooLarge);
+        }
+        let mut results = Vec::new(&env);
+        let mut i = 0;
+        while i < users.len() {
+            let user = users.get(i).unwrap();
+            results.push_back(Self::build_position(&env, &user)?);
+            i += 1;
+        }
+        Ok(results)
+    }
+
+    /// Returns the ledger at which the user's current reward accrual period started.
+    ///
+    /// Reads `last_claim_ledger` from the user's `StakePosition`. This value is reset
+    /// on every reward settlement (claim, stake top-up, or unstake), so it marks the
+    /// ledger from which rewards are currently accruing. Reverts with `PositionNotFound`
+    /// if the user has no active position.
+    pub fn claimable_since(env: Env, user: Address) -> Result<u32, VaultError> {
+        match Self::build_position(&env, &user)? {
+            Some(p) => Ok(p.last_claim_ledger),
+            None => Err(VaultError::PositionNotFound),
+        }
+    }
+
     /// Read-only governance weight using the user's current staked shares.
     pub fn current_vote_weight(env: Env, user: Address) -> Result<i128, VaultError> {
         let _ = admin::get_admin(&env)?;
@@ -175,10 +237,23 @@ impl VaultContract {
             .ok_or(VaultError::ArithmeticError)
     }
 
-    /// Read-only query for pending staking rewards.
+    /// Read-only query for pending staking rewards, expressed in reward token
+    /// decimals. Internally rewards accrue in stake token precision, so the
+    /// result is normalized to the reward token's precision before returning.
     pub fn calc_pending_reward(env: Env, user: Address) -> Result<i128, VaultError> {
         let _ = admin::get_admin(&env)?;
-        Self::pending_reward(&env, &user)
+        let raw = Self::pending_reward(&env, &user)?;
+        Self::normalize_to_reward_decimals(&env, raw)
+    }
+
+    /// Read-only query for the configured stake token decimal precision.
+    pub fn stake_decimals(env: Env) -> u32 {
+        balance::get_stake_decimals(&env)
+    }
+
+    /// Read-only query for the configured reward token decimal precision.
+    pub fn reward_decimals(env: Env) -> u32 {
+        balance::get_reward_decimals(&env)
     }
 
     /// Query total shares and deposited amounts.
@@ -360,6 +435,7 @@ impl VaultContract {
             if total_stakers > 0 {
                 balance::set_total_stakers(&env, total_stakers - 1);
             }
+            Self::remove_from_staker_list(&env, &user);
             events::position_closed(&env, &user);
         }
         Self::record_stake_snapshot(&env, &user, new_user_shares);
@@ -480,6 +556,27 @@ impl VaultContract {
             .get(&DataKey::EarlyExitPenaltyBps)
             .unwrap_or(0);
         Ok((lock_period, penalty_bps))
+    }
+
+    /// Admin: set the unstake fee in basis points charged on exit.
+    ///
+    /// The fee is deducted from the principal returned to the user (after any
+    /// lock-up penalty) and routed to the reward pool treasury. Pass `0` to
+    /// disable. The maximum is 500 bps (5%); higher values are rejected with
+    /// `UnstakeFeeTooHigh`.
+    pub fn set_unstake_fee_bps(env: Env, admin: Address, bps: u32) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        let _ = admin; // argument follows existing admin patterns; auth enforced above
+        if bps > MAX_UNSTAKE_FEE_BPS {
+            return Err(VaultError::UnstakeFeeTooHigh);
+        }
+        balance::set_unstake_fee_bps(&env, bps);
+        Ok(())
+    }
+
+    /// Read-only query for the current unstake fee in basis points.
+    pub fn get_unstake_fee_bps(env: Env) -> u32 {
+        balance::get_unstake_fee_bps(&env)
     }
 
     /// Admin: set the minimum stake. Zero disables the minimum.
@@ -770,6 +867,31 @@ impl VaultContract {
         ))
     }
 
+    // --- Total claimable (Issue #95) ---
+
+    /// Returns the sum of all pending rewards owed to active stakers at the current ledger.
+    ///
+    /// This is a read-only approximation — rewards keep accruing after the query returns.
+    /// Supports up to 200 registered stakers. Reverts with `TooManyStakers` beyond that
+    /// limit to prevent compute overflow. No auth required.
+    pub fn get_total_claimable(env: Env) -> Result<i128, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        let all_stakers = balance::get_all_stakers(&env);
+        if all_stakers.len() > 200 {
+            return Err(VaultError::TooManyStakers);
+        }
+        let mut total: i128 = 0;
+        let mut i = 0;
+        while i < all_stakers.len() {
+            let user = all_stakers.get(i).unwrap();
+            let raw = Self::pending_reward(&env, &user)?;
+            let normalized = Self::normalize_to_reward_decimals(&env, raw)?;
+            total = total.checked_add(normalized).ok_or(VaultError::ArithmeticError)?;
+            i += 1;
+        }
+        Ok(total)
+    }
+
     // --- Pool statistics (#38) ---
 
     /// Aggregate pool statistics for frontend dashboards.
@@ -918,8 +1040,12 @@ impl VaultContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::StakedAtLedger(beneficiary.clone()), &current_ledger);
+            balance::set_last_claim_ledger(&env, &beneficiary, current_ledger);
             let total_stakers = balance::get_total_stakers(&env);
             balance::set_total_stakers(&env, total_stakers + 1);
+            let mut all_stakers = balance::get_all_stakers(&env);
+            all_stakers.push_back(beneficiary.clone());
+            balance::set_all_stakers(&env, &all_stakers);
             events::position_opened(&env, &beneficiary, amount);
         }
         Self::record_stake_snapshot(&env, &beneficiary, new_shares);
@@ -931,12 +1057,14 @@ impl VaultContract {
     }
 
     /// Admin: slash a user's staked principal. Can be called while paused.
-    /// `admin_addr` must be the admin and is provided to follow existing patterns.
+    /// `admin_addr` must equal the stored admin address; mismatches return `Unauthorized`.
     /// Returns the actual slashed token amount.
     pub fn slash(env: Env, admin_addr: Address, user: Address, amount: i128) -> Result<i128, VaultError> {
-        // authorization: caller must be admin (enforced by require_admin)
-        admin::require_admin(&env)?;
-        // admin_addr is an argument (follows other admin methods) but we still check admin auth above
+        let stored_admin = admin::get_admin(&env)?;
+        if admin_addr != stored_admin {
+            return Err(VaultError::Unauthorized);
+        }
+        admin_addr.require_auth();
 
         if amount <= 0 {
             return Err(VaultError::ZeroAmount);
@@ -997,6 +1125,7 @@ impl VaultContract {
             if total_stakers > 0 {
                 balance::set_total_stakers(&env, total_stakers - 1);
             }
+            Self::remove_from_staker_list(&env, &user);
             events::position_closed(&env, &user);
         }
         Self::record_stake_snapshot(&env, &user, new_user_shares);
@@ -1441,6 +1570,20 @@ impl VaultContract {
 
     // --- Internal helpers ---
 
+    fn remove_from_staker_list(env: &Env, user: &Address) {
+        let stakers = balance::get_all_stakers(env);
+        let mut updated = Vec::new(env);
+        let mut i = 0;
+        while i < stakers.len() {
+            let s = stakers.get(i).unwrap();
+            if s != *user {
+                updated.push_back(s);
+            }
+            i += 1;
+        }
+        balance::set_all_stakers(env, &updated);
+    }
+
     fn do_stake(env: &Env, staker: &Address, amount: i128) -> Result<i128, VaultError> {
         staker.require_auth();
         Self::require_not_paused(env)?;
@@ -1505,8 +1648,12 @@ impl VaultContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::StakedAtLedger(staker.clone()), &current_ledger);
+            balance::set_last_claim_ledger(env, staker, current_ledger);
             let total_stakers = balance::get_total_stakers(env);
             balance::set_total_stakers(env, total_stakers + 1);
+            let mut all_stakers = balance::get_all_stakers(env);
+            all_stakers.push_back(staker.clone());
+            balance::set_all_stakers(env, &all_stakers);
             events::position_opened(env, staker, amount);
         }
         Self::record_stake_snapshot(env, staker, new_shares);
@@ -1561,7 +1708,10 @@ impl VaultContract {
             .instance()
             .get(&DataKey::LockPeriod)
             .unwrap_or(0);
-        let penalty_bps = env
+        // Must be read as u32 to match how `set_early_exit_penalty_bps` stores
+        // it; an inferred `i32` would panic on deserialization once a penalty
+        // is configured.
+        let penalty_bps: u32 = env
             .storage()
             .instance()
             .get(&DataKey::EarlyExitPenaltyBps)
@@ -1581,7 +1731,7 @@ impl VaultContract {
             }
         };
 
-        let amount_returned = if is_locked && penalty_bps > 0 {
+        let amount_after_penalty = if is_locked && penalty_bps > 0 {
             let penalty = amount
                 .checked_mul(penalty_bps as i128)
                 .ok_or(VaultError::ArithmeticError)?
@@ -1592,10 +1742,32 @@ impl VaultContract {
             amount
         };
 
+        // Unstake fee: charged on the post-penalty amount returned to the user
+        // and routed to the reward pool treasury (not burned). Applied after the
+        // lock-up penalty so both can be active simultaneously.
+        let unstake_fee_bps = balance::get_unstake_fee_bps(env);
+        let unstake_fee = if unstake_fee_bps > 0 {
+            amount_after_penalty
+                .checked_mul(unstake_fee_bps as i128)
+                .ok_or(VaultError::ArithmeticError)?
+                .checked_div(BOOST_BPS_BASE as i128)
+                .ok_or(VaultError::ArithmeticError)?
+        } else {
+            0
+        };
+        let amount_returned = amount_after_penalty - unstake_fee;
+
         let new_user_shares = user_shares - shares;
         balance::set_shares(env, staker, new_user_shares);
         balance::set_total_shares(env, total_shares - shares);
-        balance::set_total_deposited(env, total_deposited - amount_returned);
+        // Both the returned principal and the fee leave the staked pool; the fee
+        // is credited to the reward treasury below.
+        balance::set_total_deposited(env, total_deposited - amount_returned - unstake_fee);
+
+        if unstake_fee > 0 {
+            let reward_pool = balance::get_reward_pool_balance(env);
+            balance::set_reward_pool_balance(env, reward_pool + unstake_fee);
+        }
 
         if new_user_shares == 0 {
             env.storage()
@@ -1605,6 +1777,7 @@ impl VaultContract {
             if total_stakers > 0 {
                 balance::set_total_stakers(env, total_stakers - 1);
             }
+            Self::remove_from_staker_list(env, staker);
             events::position_closed(env, staker);
         }
         Self::record_stake_snapshot(env, staker, new_user_shares);
@@ -1833,6 +2006,51 @@ impl VaultContract {
             _ => (BOOST_BPS_BASE, u32::MAX),
         }
     }
+
+    /// Normalize a reward computed in stake token precision to reward token
+    /// precision.
+    ///
+    /// Rewards are derived from staked amounts, so they inherit the stake
+    /// token's decimal scale. When the reward token uses a different precision
+    /// the value must be rescaled by the ratio of the two scales:
+    ///
+    /// ```text
+    ///     normalized = raw * 10^reward_decimals / 10^stake_decimals
+    /// ```
+    ///
+    /// To preserve precision and avoid spurious overflow this is applied as a
+    /// single multiply or divide by `10^|reward_decimals - stake_decimals|`:
+    ///   - reward_decimals > stake_decimals → scale up (multiply)
+    ///   - reward_decimals < stake_decimals → scale down (divide, truncating)
+    ///   - reward_decimals == stake_decimals → unchanged
+    fn normalize_to_reward_decimals(env: &Env, raw: i128) -> Result<i128, VaultError> {
+        let stake_decimals = balance::get_stake_decimals(env);
+        let reward_decimals = balance::get_reward_decimals(env);
+
+        if reward_decimals == stake_decimals {
+            return Ok(raw);
+        }
+
+        if reward_decimals > stake_decimals {
+            let factor = Self::pow10(reward_decimals - stake_decimals)?;
+            raw.checked_mul(factor).ok_or(VaultError::ArithmeticError)
+        } else {
+            let factor = Self::pow10(stake_decimals - reward_decimals)?;
+            Ok(raw / factor)
+        }
+    }
+
+    /// Compute `10^exp` as an `i128`, returning `ArithmeticError` on overflow.
+    fn pow10(exp: u32) -> Result<i128, VaultError> {
+        let mut result: i128 = 1;
+        let mut i = 0;
+        while i < exp {
+            result = result.checked_mul(10).ok_or(VaultError::ArithmeticError)?;
+            i += 1;
+        }
+        Ok(result)
+    }
+
 
     fn reward_for_ledgers(
         amount: i128,
@@ -2133,8 +2351,12 @@ impl VaultContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::StakedAtLedger(staker.clone()), &current_ledger);
+            balance::set_last_claim_ledger(env, staker, current_ledger);
             let total_stakers = balance::get_total_stakers(env);
             balance::set_total_stakers(env, total_stakers + 1);
+            let mut all_stakers = balance::get_all_stakers(env);
+            all_stakers.push_back(staker.clone());
+            balance::set_all_stakers(env, &all_stakers);
             events::position_opened(env, staker, amount);
         }
         Self::record_stake_snapshot(env, staker, new_shares);

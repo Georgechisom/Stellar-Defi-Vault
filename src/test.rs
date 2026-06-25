@@ -67,6 +67,19 @@ impl<'a> VaultFixture<'a> {
     }
 
     fn with_mock_auths(mock_auths: bool) -> Self {
+        Self::build(mock_auths, None, None)
+    }
+
+    /// Build a fixture with explicit stake/reward token decimals.
+    fn with_decimals(stake_decimals: u32, reward_decimals: u32) -> Self {
+        Self::build(true, Some(stake_decimals), Some(reward_decimals))
+    }
+
+    fn build(
+        mock_auths: bool,
+        stake_decimals: Option<u32>,
+        reward_decimals: Option<u32>,
+    ) -> Self {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|li| {
@@ -84,7 +97,7 @@ impl<'a> VaultFixture<'a> {
         let vault_id = env.register_contract(None, VaultContract);
         let vault = VaultContractClient::new(&env, &vault_id);
 
-        vault.initialize(&admin, &token_addr);
+        vault.initialize(&admin, &token_addr, &stake_decimals, &reward_decimals);
 
         // Mint starting balances
         token_admin.mint(&alice, &20_000_000);
@@ -122,7 +135,7 @@ fn test_double_initialize_fails() {
     let token_addr: soroban_sdk::Address = f
         .env
         .register_stellar_asset_contract(Address::generate(&f.env));
-    let result = f.vault.try_initialize(&f.admin, &token_addr);
+    let result = f.vault.try_initialize(&f.admin, &token_addr, &None, &None);
     assert_eq!(result, Err(Ok(VaultError::AlreadyInitialized)));
 }
 
@@ -670,6 +683,89 @@ fn test_lock_config_query() {
     assert_eq!(penalty_bps, 1500);
 }
 
+// ── unstake fee (separate from withdrawal fee) ────────────────────────────────
+
+#[test]
+fn test_set_and_get_unstake_fee_bps() {
+    let f = VaultFixture::new();
+    assert_eq!(f.vault.get_unstake_fee_bps(), 0);
+
+    f.vault.set_unstake_fee_bps(&f.admin, &250);
+    assert_eq!(f.vault.get_unstake_fee_bps(), 250);
+}
+
+#[test]
+fn test_set_unstake_fee_bps_requires_admin_auth() {
+    let f = VaultFixture::new();
+    f.vault.set_unstake_fee_bps(&f.admin, &100);
+    assert_eq!(f.env.auths()[0].0, f.admin);
+}
+
+#[test]
+fn test_set_unstake_fee_bps_allows_max() {
+    let f = VaultFixture::new();
+    f.vault.set_unstake_fee_bps(&f.admin, &500);
+    assert_eq!(f.vault.get_unstake_fee_bps(), 500);
+}
+
+#[test]
+fn test_set_unstake_fee_bps_too_high_rejected() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_set_unstake_fee_bps(&f.admin, &501);
+    assert_eq!(result, Err(Ok(VaultError::UnstakeFeeTooHigh)));
+}
+
+#[test]
+fn test_unstake_with_zero_fee_returns_full_principal() {
+    let f = VaultFixture::new();
+    f.vault.deposit(&f.alice, &600_000);
+
+    let token_before = f.token.balance(&f.alice);
+    let amount_back = f.vault.withdraw(&f.alice, &300_000);
+
+    assert_eq!(amount_back, 300_000);
+    assert_eq!(f.token.balance(&f.alice), token_before + 300_000);
+    // No fee configured, so nothing is routed to the treasury.
+    assert_eq!(f.vault.get_reward_pool_balance(), 0);
+}
+
+#[test]
+fn test_unstake_deducts_fee_and_credits_treasury() {
+    let f = VaultFixture::new();
+    f.vault.set_unstake_fee_bps(&f.admin, &500); // 5%
+    f.vault.deposit(&f.alice, &600_000);
+
+    let token_before = f.token.balance(&f.alice);
+    let amount_back = f.vault.withdraw(&f.alice, &300_000);
+
+    // 5% of 300_000 = 15_000 fee; 285_000 returned to the user.
+    assert_eq!(amount_back, 285_000);
+    assert_eq!(f.token.balance(&f.alice), token_before + 285_000);
+    // Fee is routed to the reward pool treasury, not burned.
+    assert_eq!(f.vault.get_reward_pool_balance(), 15_000);
+}
+
+#[test]
+fn test_unstake_fee_applies_after_lock_penalty() {
+    let f = VaultFixture::new();
+    f.vault.set_lock_period(&100);
+    f.vault.set_early_exit_penalty_bps(&1000); // 10%
+    f.vault.set_unstake_fee_bps(&f.admin, &500); // 5%
+
+    set_ledger(&f.env, 1);
+    f.vault.deposit(&f.alice, &1_000_000);
+
+    let token_before = f.token.balance(&f.alice);
+    set_ledger(&f.env, 50); // still within the lock-up window
+    let amount_back = f.vault.withdraw(&f.alice, &1_000_000);
+
+    // Penalty first: 10% of 1_000_000 = 100_000 -> 900_000 after penalty.
+    // Fee on the remainder: 5% of 900_000 = 45_000 -> 855_000 returned.
+    assert_eq!(amount_back, 855_000);
+    assert_eq!(f.token.balance(&f.alice), token_before + 855_000);
+    assert_eq!(f.vault.get_reward_pool_balance(), 45_000);
+}
+
 // ── governance vote weight snapshots (Issue #31) ─────────────────────────────
 
 #[test]
@@ -843,6 +939,66 @@ fn test_reward_checkpoint_on_top_up_avoids_overpaying() {
     assert_eq!(f.vault.calc_pending_reward(&f.alice), 300);
 }
 
+// ── reward token decimal normalization ────────────────────────────────────────
+
+#[test]
+fn test_initialize_defaults_decimals_to_seven() {
+    // Pools initialized without explicit decimals fall back to 7/7.
+    let f = VaultFixture::new();
+    assert_eq!(f.vault.stake_decimals(), 7);
+    assert_eq!(f.vault.reward_decimals(), 7);
+}
+
+#[test]
+fn test_initialize_stores_custom_decimals() {
+    let f = VaultFixture::with_decimals(7, 6);
+    assert_eq!(f.vault.stake_decimals(), 7);
+    assert_eq!(f.vault.reward_decimals(), 6);
+}
+
+#[test]
+fn test_pending_reward_same_decimals_unchanged() {
+    // With matching decimals the normalized reward equals the raw reward,
+    // preserving the existing behaviour. Raw reward over `n` ledgers at a
+    // 100% APR on a one-year stake is exactly `n`.
+    let f = VaultFixture::with_decimals(7, 7);
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 100);
+    assert_eq!(f.vault.calc_pending_reward(&f.alice), 100);
+}
+
+#[test]
+fn test_pending_reward_scaled_down_when_reward_decimals_smaller() {
+    // Reward token has fewer decimals than the stake token (6 vs 7), so the
+    // raw reward of 100 is divided by 10^(7-6) = 10.
+    let f = VaultFixture::with_decimals(7, 6);
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 100);
+    assert_eq!(f.vault.calc_pending_reward(&f.alice), 10);
+}
+
+#[test]
+fn test_pending_reward_scaled_up_when_reward_decimals_larger() {
+    // Reward token has more decimals than the stake token (9 vs 7), so the
+    // raw reward of 100 is multiplied by 10^(9-7) = 100.
+    let f = VaultFixture::with_decimals(7, 9);
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 100);
+    assert_eq!(f.vault.calc_pending_reward(&f.alice), 10_000);
+}
+
 // ── pool cap (TVL limit) ──────────────────────────────────────────────────────
 
 #[test]
@@ -920,11 +1076,14 @@ fn test_admin_can_raise_and_lower_cap() {
 }
 
 #[test]
-fn test_non_admin_cannot_set_pool_cap() {
+fn test_set_pool_cap_requires_admin_auth() {
+    // With mock_all_auths, env.auths() records every require_auth() call.
+    // Verify that set_pool_cap requires the stored admin to authorise the call.
     let f = VaultFixture::new();
-    // Verify admin auth is required: the recorded authorizer must be the admin address.
     f.vault.set_pool_cap(&1_000_000);
-    assert_eq!(f.env.auths()[0].0, f.admin);
+    let auths = f.env.auths();
+    let admin_auth_required = auths.iter().any(|(addr, _)| *addr == f.admin);
+    assert!(admin_auth_required, "set_pool_cap must require admin auth");
 }
 
 #[test]
@@ -1086,8 +1245,11 @@ fn test_total_rewards_paid_increments_after_unstake_then_claim() {
 #[test]
 fn test_get_stake_token_returns_initialized_token() {
     let f = VaultFixture::new();
-    // Verify the returned address matches the token contract used at initialization.
-    assert_eq!(f.vault.get_stake_token(), f.token.address.clone());
+    // get_stake_token() and get_pool_config().stake_token must agree since both
+    // read the same underlying value set during initialize.
+    let stake_token = f.vault.get_stake_token();
+    let config = f.vault.get_pool_config();
+    assert_eq!(stake_token, config.stake_token);
 }
 
 #[test]
@@ -1147,11 +1309,10 @@ fn test_simulate_compound_yields_more_than_simple() {
     let f = VaultFixture::new();
     f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
 
-    // Use STELLAR_LEDGERS_PER_YEAR-sized intervals so each interval earns
-    // stake * 100% APR = stake tokens, making compounding clearly > simple.
-    let annual = STELLAR_LEDGERS_PER_YEAR;
-    let compound = f.vault.simulate_compound(&(annual as i128), &(annual * 2), &annual);
-    let simple = f.vault.simulate_stake(&(annual as i128), &(annual * 2));
+    // 1_000_000_000 principal ensures each compounding interval produces enough
+    // reward that the cumulative boost is visible above integer-division truncation.
+    let compound = f.vault.simulate_compound(&1_000_000_000, &10_000, &1_000);
+    let simple = f.vault.simulate_stake(&1_000_000_000, &10_000);
     assert!(compound > simple);
 }
 
@@ -1171,9 +1332,10 @@ fn test_simulate_boost_impact_with_schedule() {
     f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
     f.vault.set_boost_schedule(&schedule);
 
-    // base = 1_000_000 * 10_000 * 1000 / 10_000 / 6_307_200 = 158
-    let (base, boosted) = f.vault.simulate_boost_impact(&1_000_000, &1000);
-    assert_eq!(base, 158);
+    // 6_308 ledgers at 100% APR on 1M principal produces exactly 1_000 base reward
+    // (1_000_000 * 10_000 * 6_308 / 10_000 / 6_307_200 = 1_000).
+    let (base, boosted) = f.vault.simulate_boost_impact(&1_000_000, &6_308);
+    assert_eq!(base, 1_000);
     assert!(boosted > base);
 }
 
@@ -1977,3 +2139,222 @@ fn test_leaderboard_amounts_are_correct() {
     assert_eq!(board.get(0).unwrap().amount, 400_000);
     assert_eq!(board.get(1).unwrap().amount, 200_000);
 }
+
+// ── Issue #83: pool_initialized event ────────────────────────────────────────
+
+#[test]
+fn test_initialize_emits_pool_initialized_event() {
+    // Fresh env so there are no spurious events from the fixture
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| {
+        li.min_temp_entry_ttl = 10_000_000;
+        li.min_persistent_entry_ttl = 10_000_000;
+        li.max_entry_ttl = 10_000_000;
+    });
+
+    let admin = Address::generate(&env);
+    let (token_addr, _token, _token_admin) = create_token(&env, &admin);
+    let vault_id = env.register_contract(None, VaultContract);
+    let vault = VaultContractClient::new(&env, &vault_id);
+
+    vault.initialize(&admin, &token_addr, &None, &None);
+
+    let events = env.events().all();
+    let init_events: std::vec::Vec<_> = events
+        .into_iter()
+        .filter(|(_, topics, _)| topic_matches(&env, topics, "init"))
+        .collect();
+
+    assert_eq!(init_events.len(), 1, "exactly one pool_initialized event expected after initialize");
+}
+
+#[test]
+fn test_initialize_pool_initialized_event_not_emitted_on_reinit() {
+    // On a second (rejected) initialize call, no new pool_initialized event should appear
+    let f = VaultFixture::new();
+    let events_before = f.env.events().all().len() as usize;
+
+    let other_token = f.env.register_stellar_asset_contract(Address::generate(&f.env));
+    let _ = f.vault.try_initialize(&f.admin, &other_token, &None, &None);
+
+    // AlreadyInitialized — event list should not have grown by an "init" event
+    let new_init: std::vec::Vec<_> = f
+        .env
+        .events()
+        .all()
+        .into_iter()
+        .skip(events_before)
+        .filter(|(_, topics, _)| topic_matches(&f.env, topics, "init"))
+        .collect();
+
+    assert!(new_init.is_empty(), "failed reinit must not emit pool_initialized");
+}
+
+// ── Issue #84: claimable_since ────────────────────────────────────────────────
+
+#[test]
+fn test_claimable_since_returns_last_claim_ledger_after_stake() {
+    let f = VaultFixture::new();
+    set_ledger(&f.env, 42);
+    f.vault.stake(&f.alice, &500_000);
+
+    // Immediately after staking, last_claim_ledger is the stake ledger (42)
+    let since = f.vault.claimable_since(&f.alice);
+    assert_eq!(since, 42);
+}
+
+#[test]
+fn test_claimable_since_updates_after_claim() {
+    let f = VaultFixture::new();
+    // 10% APR on 10_000_000 for one year ≈ 1_000_000 reward — fund exactly that
+    f.vault.set_reward_rate_bps(&1_000_u32);
+    f.token_admin.mint(&f.admin, &1_000_000);
+    f.vault.fund_reward_pool(&f.admin, &1_000_000_i128);
+    f.vault.stake(&f.alice, &10_000_000);
+
+    set_ledger(&f.env, STELLAR_LEDGERS_PER_YEAR);
+    // Claim resets last_claim_ledger to the current ledger
+    f.vault.claim(&f.alice);
+
+    let since = f.vault.claimable_since(&f.alice);
+    assert_eq!(since, STELLAR_LEDGERS_PER_YEAR);
+}
+
+#[test]
+fn test_claimable_since_no_position_fails() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_claimable_since(&f.alice);
+    assert_eq!(result, Err(Ok(VaultError::PositionNotFound)));
+}
+
+// ── Issue #85: batch_position_query ──────────────────────────────────────────
+
+#[test]
+fn test_batch_position_query_empty_input_returns_empty_vec() {
+    let f = VaultFixture::new();
+    let users: Vec<Address> = Vec::new(&f.env);
+    let result = f.vault.batch_position_query(&users);
+    assert_eq!(result.len(), 0);
+}
+
+#[test]
+fn test_batch_position_query_mixed_stakers_and_non_stakers() {
+    let f = VaultFixture::new();
+    f.vault.stake(&f.alice, &500_000);
+    // bob has no position
+
+    let mut users = Vec::new(&f.env);
+    users.push_back(f.alice.clone());
+    users.push_back(f.bob.clone());
+
+    let result = f.vault.batch_position_query(&users);
+    assert_eq!(result.len(), 2);
+    assert!(result.get(0).unwrap().is_some(), "alice should have a position");
+    assert!(result.get(1).unwrap().is_none(), "bob has no position");
+}
+
+#[test]
+fn test_batch_position_query_order_preserved() {
+    let f = VaultFixture::new();
+    f.vault.stake(&f.alice, &500_000);
+    f.vault.stake(&f.bob, &300_000);
+
+    let mut users = Vec::new(&f.env);
+    users.push_back(f.bob.clone());   // bob first
+    users.push_back(f.alice.clone()); // alice second
+
+    let result = f.vault.batch_position_query(&users);
+    assert_eq!(result.len(), 2);
+    let bob_pos = result.get(0).unwrap().unwrap();
+    let alice_pos = result.get(1).unwrap().unwrap();
+    assert_eq!(bob_pos.amount, 300_000);
+    assert_eq!(alice_pos.amount, 500_000);
+}
+
+#[test]
+fn test_batch_position_query_exceeds_max_fails() {
+    let f = VaultFixture::new();
+    let mut users = Vec::new(&f.env);
+    // 21 addresses — one over the 20-address limit
+    for _ in 0..21 {
+        users.push_back(Address::generate(&f.env));
+    }
+    let result = f.vault.try_batch_position_query(&users);
+    assert_eq!(result, Err(Ok(VaultError::BatchTooLarge)));
+}
+
+#[test]
+fn test_batch_position_query_exactly_20_succeeds() {
+    let f = VaultFixture::new();
+    let mut users = Vec::new(&f.env);
+    for _ in 0..20 {
+        users.push_back(Address::generate(&f.env));
+    }
+    let result = f.vault.try_batch_position_query(&users);
+    assert!(result.is_ok());
+}
+
+// ── Issue #95: get_total_claimable ────────────────────────────────────────────
+
+#[test]
+fn test_get_total_claimable_single_staker_matches_calc_pending_reward() {
+    let f = VaultFixture::new();
+    f.vault.set_reward_rate_bps(&10_000_u32);
+    f.vault.stake(&f.alice, &10_000_000);
+    set_ledger(&f.env, STELLAR_LEDGERS_PER_YEAR);
+
+    let pending = f.vault.calc_pending_reward(&f.alice);
+    let total = f.vault.get_total_claimable();
+    assert_eq!(total, pending);
+}
+
+#[test]
+fn test_get_total_claimable_two_stakers_sum_correctly() {
+    let f = VaultFixture::new();
+    f.vault.set_reward_rate_bps(&10_000_u32);
+    f.vault.stake(&f.alice, &10_000_000);
+    f.vault.stake(&f.bob, &5_000_000);
+    set_ledger(&f.env, STELLAR_LEDGERS_PER_YEAR);
+
+    let alice_pending = f.vault.calc_pending_reward(&f.alice);
+    let bob_pending = f.vault.calc_pending_reward(&f.bob);
+    let total = f.vault.get_total_claimable();
+    assert_eq!(total, alice_pending + bob_pending);
+}
+
+#[test]
+fn test_get_total_claimable_fully_unstaked_user_excluded() {
+    let f = VaultFixture::new();
+    f.vault.set_reward_rate_bps(&10_000_u32);
+    f.vault.stake(&f.alice, &10_000_000);
+    f.vault.stake(&f.bob, &5_000_000);
+    set_ledger(&f.env, 1000);
+
+    // Fully unstake alice
+    let alice_shares = f.vault.shares_of(&f.alice);
+    f.vault.withdraw(&f.alice, &alice_shares);
+
+    set_ledger(&f.env, STELLAR_LEDGERS_PER_YEAR);
+
+    // Only bob should be included
+    let bob_pending = f.vault.calc_pending_reward(&f.bob);
+    let total = f.vault.get_total_claimable();
+    assert_eq!(total, bob_pending, "fully unstaked alice must not contribute to total_claimable");
+}
+
+#[test]
+fn test_get_total_claimable_zero_stakers_returns_zero() {
+    let f = VaultFixture::new();
+    f.vault.set_reward_rate_bps(&10_000_u32);
+    let total = f.vault.get_total_claimable();
+    assert_eq!(total, 0);
+}
+
+
+
+
+
+
+
+

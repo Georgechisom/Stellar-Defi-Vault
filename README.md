@@ -10,7 +10,7 @@ A non-custodial, share-based DeFi yield vault built on **Stellar** using **Sorob
 
 ```
 VaultContract
-├── initialize(admin, token)   — one-time setup
+├── initialize(admin, token, stake_decimals?, reward_decimals?) — one-time setup (decimals default to 7)
 ├── deposit(depositor, amount) — mint shares proportional to pool
 ├── stake(staker, amount)      — staking-friendly alias for deposit
 ├── withdraw(user, shares)     — burn shares, return tokens
@@ -66,11 +66,49 @@ cargo fmt --check
 cargo clippy --features testutils -- -D warnings
 ```
 
+### Deploying to Testnet
+
+To deploy the staking vault to Stellar Testnet and initialize it:
+
+1. **Deploy and Initialize**:
+   Run the deployment script. By default, it will generate a new deployment identity (`deployer`), fund it via Friendbot, build the optimized contract WASM, deploy the contract, deploy the native XLM wrapper contract (or resolve its existing ID), and initialize the vault.
+
+   ```bash
+   make deploy-testnet
+   ```
+
+   *Alternatively, you can customize the identity or network via environment variables:*
+   ```bash
+   IDENTITY=my-identity NETWORK=testnet make deploy-testnet
+   ```
+
+2. **Configure your Environment**:
+   The script will print configuration variables. Save them to a `.env` file in the project root:
+   ```env
+   CONTRACT_ID=CB...
+   TOKEN_ID=CD...
+   IDENTITY=my-identity
+   NETWORK=testnet
+   ```
+
+3. **Staking via CLI**:
+   Stake tokens into the vault (amount in raw units, e.g., 10 XLM = `100000000` stroops):
+   ```bash
+   make stake AMOUNT=100000000
+   ```
+
+4. **Claiming Rewards**:
+   Claim accrued rewards from the vault:
+   ```bash
+   make claim
+   ```
+
+
 ## Contract Interface
 
 | Function | Auth Required | Description |
 |---|---|---|
-| `initialize(admin, token)` | — | One-time init |
+| `initialize(admin, token, stake_decimals?, reward_decimals?)` | — | One-time init; decimals default to 7 |
 | `deposit(depositor, amount)` | depositor | Deposit tokens, receive shares |
 | `stake(staker, amount)` | staker | Alias for `deposit` |
 | `withdraw(user, shares)` | user | Burn shares, receive tokens |
@@ -85,6 +123,8 @@ cargo clippy --features testutils -- -D warnings
 | `vault_state()` | — | Query pool totals |
 | `set_min_stake(amount)` | admin | Configure minimum stake; `0` disables it |
 | `get_min_stake()` | — | Read current minimum stake |
+| `set_unstake_fee_bps(admin, bps)` | admin | Configure unstake fee (max 500 bps); `0` disables it |
+| `get_unstake_fee_bps()` | — | Read current unstake fee in bps |
 | `set_reward_rate_bps(rate_bps)` | admin | Configure base reward APR |
 | `fund_reward_pool(admin_addr, amount)` | admin | Deposit claimable rewards |
 | `set_boost_schedule(tiers)` | admin | Configure up to 5 reward-boost tiers |
