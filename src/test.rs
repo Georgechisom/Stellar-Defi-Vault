@@ -1016,3 +1016,161 @@ fn test_set_pool_cap_negative_fails() {
     let result = f.vault.try_set_pool_cap(&-1);
     assert_eq!(result, Err(Ok(VaultError::ZeroAmount)));
 }
+
+// ── total_rewards_paid (Issue #71) ──────────────────────────────────────────
+
+#[test]
+fn test_total_rewards_paid_starts_at_zero() {
+    let f = VaultFixture::new();
+    assert_eq!(f.vault.total_rewards_paid(), 0);
+}
+
+#[test]
+fn test_total_rewards_paid_increments_after_claim() {
+    let f = VaultFixture::new();
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.token_admin.mint(&f.admin, &(annual_stake * 2));
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.fund_reward_pool(&f.admin, &(annual_stake * 2));
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 100);
+    let claim_amount = f.vault.claim(&f.alice);
+    assert!(claim_amount > 0);
+    assert_eq!(f.vault.total_rewards_paid(), claim_amount);
+}
+
+#[test]
+fn test_total_rewards_paid_accumulates_across_claims() {
+    let f = VaultFixture::new();
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.token_admin.mint(&f.admin, &(annual_stake * 2));
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.fund_reward_pool(&f.admin, &(annual_stake * 2));
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 100);
+    let claim1 = f.vault.claim(&f.alice);
+    assert_eq!(f.vault.total_rewards_paid(), claim1);
+
+    set_ledger(&f.env, 200);
+    let claim2 = f.vault.claim(&f.alice);
+    assert_eq!(f.vault.total_rewards_paid(), claim1 + claim2);
+}
+
+#[test]
+fn test_total_rewards_paid_increments_after_unstake_then_claim() {
+    let f = VaultFixture::new();
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.token_admin.mint(&f.admin, &(annual_stake * 2));
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.fund_reward_pool(&f.admin, &(annual_stake * 2));
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 100);
+    f.vault.unstake(&f.alice, &annual_stake);
+
+    let claim_amount = f.vault.claim(&f.alice);
+    assert!(claim_amount > 0);
+    assert_eq!(f.vault.total_rewards_paid(), claim_amount);
+}
+
+// ── get_stake_token (Issue #64) ─────────────────────────────────────────────
+
+#[test]
+fn test_get_stake_token_returns_initialized_token() {
+    let f = VaultFixture::new();
+    let token_addr: soroban_sdk::Address = f
+        .env
+        .storage()
+        .instance()
+        .get(&crate::storage::DataKey::Token)
+        .unwrap();
+    assert_eq!(f.vault.get_stake_token(), token_addr);
+}
+
+#[test]
+fn test_get_stake_token_before_init_fails() {
+    let env = Env::default();
+    let vault_id = env.register_contract(None, VaultContract);
+    let vault = VaultContractClient::new(&env, &vault_id);
+    let result = vault.try_get_stake_token();
+    assert_eq!(result, Err(Ok(VaultError::NotInitialized)));
+}
+
+// ── simulation functions (Issue #54) ────────────────────────────────────────
+
+#[test]
+fn test_simulate_stake_zero_rate() {
+    let f = VaultFixture::new();
+    assert_eq!(f.vault.simulate_stake(&1_000_000, &1000), 0);
+}
+
+#[test]
+fn test_simulate_stake_known_output() {
+    let f = VaultFixture::new();
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+
+    let result = f.vault.simulate_stake(&1_000_000, &STELLAR_LEDGERS_PER_YEAR);
+    assert_eq!(result, 1_000_000);
+}
+
+#[test]
+fn test_simulate_compound_zero_rate() {
+    let f = VaultFixture::new();
+    assert_eq!(f.vault.simulate_compound(&1_000_000, &1000, &100), 0);
+}
+
+#[test]
+fn test_simulate_compound_zero_interval() {
+    let f = VaultFixture::new();
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    assert_eq!(f.vault.simulate_compound(&1_000_000, &1000, &0), 0);
+}
+
+#[test]
+fn test_simulate_compound_matches_single_stake_for_one_interval() {
+    let f = VaultFixture::new();
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+
+    let ledgers = 1000;
+    let compound = f
+        .vault
+        .simulate_compound(&1_000_000, &ledgers, &ledgers);
+    let simple = f.vault.simulate_stake(&1_000_000, &ledgers);
+    assert_eq!(compound, simple);
+}
+
+#[test]
+fn test_simulate_compound_yields_more_than_simple() {
+    let f = VaultFixture::new();
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+
+    let compound = f.vault.simulate_compound(&1_000_000, &10_000, &1_000);
+    let simple = f.vault.simulate_stake(&1_000_000, &10_000);
+    assert!(compound > simple);
+}
+
+#[test]
+fn test_simulate_boost_impact_no_schedule() {
+    let f = VaultFixture::new();
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+
+    let (base, boosted) = f.vault.simulate_boost_impact(&1_000_000, &1000);
+    assert_eq!(base, boosted);
+}
+
+#[test]
+fn test_simulate_boost_impact_with_schedule() {
+    let f = VaultFixture::new();
+    let schedule = boost_schedule(&f.env, &[(500, 15_000)]);
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.set_boost_schedule(&schedule);
+
+    let (base, boosted) = f.vault.simulate_boost_impact(&1_000_000, &1000);
+    assert_eq!(base, 1_000);
+    assert!(boosted > base);
+}
