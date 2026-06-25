@@ -47,6 +47,12 @@ pub fn rate_changed(env: &Env, old_rate_bps: u32, new_rate_bps: u32) {
         .publish(topics, (old_rate_bps, new_rate_bps, env.ledger().sequence()));
 }
 
+pub fn pool_cap_updated(env: &Env, admin: &Address, new_cap: i128) {
+    let topics = (symbol_short!("cap_upd"), admin);
+    env.events()
+        .publish(topics, (new_cap, env.ledger().sequence()));
+}
+
 pub fn position_opened(env: &Env, user: &Address, amount: i128) {
     let topics = (symbol_short!("pos_open"), user);
     env.events()
@@ -169,5 +175,47 @@ pub fn admin_action_set_reward_token(env: &Env, actor: &Address, token: &Address
     env.events().publish(
         (symbol_short!("adm_act"), AdminAction::SetRewardToken),
         (actor.clone(), env.ledger().sequence(), token.clone()),
+pub fn slash(env: &Env, admin: &Address, user: &Address, amount: i128) {
+    let topics = (symbol_short!("slash"), admin);
+    env.events()
+        .publish(topics, (user.clone(), amount, env.ledger().sequence()));
+}
+
+pub fn position_transferred(env: &Env, from: &Address, to: &Address, amount: i128) {
+    let topics = (symbol_short!("pos_xfer"), from);
+    env.events()
+        .publish(topics, (to.clone(), amount, env.ledger().sequence()));
+}
+
+pub fn campaign_started(env: &Env, admin: &Address, multiplier_bps: u32, ends_at_ledger: u32) {
+    let topics = (symbol_short!("camp_on"), admin);
+    env.events()
+        .publish(topics, (multiplier_bps, ends_at_ledger, env.ledger().sequence()));
+}
+
+pub fn campaign_ended(env: &Env, admin: &Address) {
+    let topics = (symbol_short!("camp_off"), admin);
+    env.events().publish(topics, (env.ledger().sequence(),));
+}
+
+/// Emitted when a user claims staking rewards (via `claim` or `stake_and_claim`).
+pub fn claimed(env: &Env, user: &Address, reward: i128) {
+    let topics = (symbol_short!("claimed"), user);
+    env.events()
+        .publish(topics, (reward, env.ledger().sequence()));
+}
+
+/// Emitted by `initialize` so indexers can detect new pool deployments on-chain.
+pub fn pool_initialized(
+    env: &Env,
+    admin: &Address,
+    stake_token: &Address,
+    reward_token: &Address,
+    reward_rate_bps: u32,
+) {
+    let topics = (symbol_short!("init"),);
+    env.events().publish(
+        topics,
+        (admin.clone(), stake_token.clone(), reward_token.clone(), reward_rate_bps),
     );
 }

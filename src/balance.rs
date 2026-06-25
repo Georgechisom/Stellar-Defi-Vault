@@ -1,4 +1,4 @@
-use crate::storage::DataKey;
+use crate::storage::{ClaimWindow, DataKey};
 use soroban_sdk::{Address, Env, Vec};
 
 pub fn get_shares(env: &Env, user: &Address) -> i128 {
@@ -62,6 +62,21 @@ pub fn set_reward_rate_bps(env: &Env, rate_bps: u32) {
         .set(&DataKey::RewardRateBps, &rate_bps);
 }
 
+pub fn get_rate_history(env: &Env) -> Vec<(u32, u32)> {
+    env.storage()
+        .instance()
+        .get(&DataKey::RateHistory)
+        .unwrap_or(Vec::new(env))
+}
+
+pub fn set_rate_history(env: &Env, history: &Vec<(u32, u32)>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::RateHistory, history);
+}
+
+pub const MAX_RATE_HISTORY_ENTRIES: u32 = 50;
+
 pub fn get_reward_pool_balance(env: &Env) -> i128 {
     env.storage()
         .instance()
@@ -83,6 +98,28 @@ pub fn set_withdrawal_limit(env: &Env, limit: i128) {
     env.storage()
         .instance()
         .set(&DataKey::WithdrawalLimit, &limit);
+}
+
+pub fn get_pool_cap(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::PoolCap)
+        .unwrap_or(0)
+}
+
+pub fn set_pool_cap(env: &Env, cap: i128) {
+    env.storage().instance().set(&DataKey::PoolCap, &cap);
+}
+
+pub fn get_unstake_fee_bps(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::UnstakeFeeBps)
+        .unwrap_or(0)
+}
+
+pub fn set_unstake_fee_bps(env: &Env, bps: u32) {
+    env.storage().instance().set(&DataKey::UnstakeFeeBps, &bps);
 }
 
 pub fn get_reward_checkpoint_ledger(env: &Env, user: &Address) -> Option<u32> {
@@ -251,6 +288,85 @@ pub fn increment_admin_action_count(env: &Env) {
     env.storage().instance().set(&DataKey::AdminActionCount, &(count + 1));
 }
 
+// ── Claim cap (issue #78) ─────────────────────────────────────────────────────
+
+pub fn get_claim_cap(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKey::ClaimCap).unwrap_or(0)
+}
+
+pub fn set_claim_cap(env: &Env, cap: i128) {
+    env.storage().instance().set(&DataKey::ClaimCap, &cap);
+}
+
+pub fn get_claim_cap_window(env: &Env) -> u32 {
+    env.storage().instance().get(&DataKey::ClaimCapWindow).unwrap_or(0)
+}
+
+pub fn set_claim_cap_window(env: &Env, window_ledgers: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::ClaimCapWindow, &window_ledgers);
+}
+
+pub fn get_user_claim_window(env: &Env, user: &Address) -> Option<ClaimWindow> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UserClaimWindow(user.clone()))
+}
+
+pub fn set_user_claim_window(env: &Env, user: &Address, window: &ClaimWindow) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserClaimWindow(user.clone()), window);
+}
+
+// ── Token decimals (reward normalization) ─────────────────────────────────────
+
+/// Default decimal precision for Stellar tokens. Most tokens use 7 places,
+/// but this is only a fallback for pools initialized without explicit values.
+pub const DEFAULT_TOKEN_DECIMALS: u32 = 7;
+
+pub fn get_stake_decimals(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::StakeDecimals)
+        .unwrap_or(DEFAULT_TOKEN_DECIMALS)
+}
+
+pub fn set_stake_decimals(env: &Env, decimals: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::StakeDecimals, &decimals);
+}
+
+pub fn get_reward_decimals(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::RewardDecimals)
+        .unwrap_or(DEFAULT_TOKEN_DECIMALS)
+}
+
+pub fn set_reward_decimals(env: &Env, decimals: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::RewardDecimals, &decimals);
+}
+
+// ── All-stakers list (issue #95) ──────────────────────────────────────────────
+
+pub fn get_all_stakers(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::AllStakers)
+        .unwrap_or(Vec::new(env))
+}
+
+pub fn set_all_stakers(env: &Env, stakers: &Vec<Address>) {
+    env.storage().instance().set(&DataKey::AllStakers, stakers);
+}
+
+// ── Share math ────────────────────────────────────────────────────────────────
+
 /// Convert a deposit amount to shares using current vault ratio.
 /// First deposit: 1:1. Subsequent: proportional to existing pool.
 pub fn amount_to_shares(total_shares: i128, total_deposited: i128, amount: i128) -> Option<i128> {
@@ -273,3 +389,17 @@ pub fn shares_to_amount(total_shares: i128, total_deposited: i128, shares: i128)
             .checked_div(total_shares)
     }
 }
+
+pub fn get_reward_remainder(env: &Env, user: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::RewardRemainder(user.clone()))
+        .unwrap_or(0)
+}
+
+pub fn set_reward_remainder(env: &Env, user: &Address, amount: i128) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::RewardRemainder(user.clone()), &amount);
+}
+
