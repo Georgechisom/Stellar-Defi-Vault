@@ -85,3 +85,10 @@ pub fn campaign_ended(env: &Env, admin: &Address) {
     let topics = (symbol_short!("camp_off"), admin);
     env.events().publish(topics, (env.ledger().sequence(),));
 }
+
+/// Emitted when a user claims staking rewards (via `claim` or `stake_and_claim`).
+pub fn claimed(env: &Env, user: &Address, reward: i128) {
+    let topics = (symbol_short!("claimed"), user);
+    env.events()
+        .publish(topics, (reward, env.ledger().sequence()));
+}
