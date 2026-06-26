@@ -1512,6 +1512,55 @@ fn test_cap_disabled_allows_unlimited_staking() {
 }
 
 #[test]
+fn test_max_positions_staking_within_limit_succeeds() {
+    let f = VaultFixture::new();
+    f.vault.set_max_positions_per_user(&f.admin, &1);
+
+    let shares = f.vault.stake(&f.alice, &100_000);
+    assert_eq!(shares, 100_000);
+}
+
+#[test]
+fn test_max_positions_exceeding_limit_fails() {
+    let f = VaultFixture::new();
+    f.vault.set_max_positions_per_user(&f.admin, &1);
+
+    f.vault.stake(&f.alice, &100_000);
+    let result = f.vault.try_stake(&f.alice, &10_000);
+    assert_eq!(result, Err(Ok(VaultError::MaxPositionsReached)));
+}
+
+#[test]
+fn test_max_positions_zero_disables_limit() {
+    let f = VaultFixture::new();
+    f.vault.set_max_positions_per_user(&f.admin, &0);
+    assert_eq!(f.vault.get_max_positions_per_user(), 0);
+
+    f.vault.stake(&f.alice, &100_000);
+    let result = f.vault.try_stake(&f.alice, &10_000);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_set_max_positions_above_ten_rejected() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_set_max_positions_per_user(&f.admin, &11);
+    assert_eq!(result, Err(Ok(VaultError::MaxPositionsTooHigh)));
+}
+
+#[test]
+fn test_admin_can_lower_max_positions_without_affecting_existing_positions() {
+    let f = VaultFixture::new();
+    f.vault.set_max_positions_per_user(&f.admin, &10);
+    f.vault.stake(&f.alice, &100_000);
+
+    f.vault.set_max_positions_per_user(&f.admin, &1);
+    assert_eq!(f.vault.get_max_positions_per_user(), 1);
+    assert_eq!(f.vault.shares_of(&f.alice), 100_000);
+    assert!(f.vault.position_of(&f.alice).is_some());
+}
+
+#[test]
 fn test_admin_can_raise_and_lower_cap() {
     let f = VaultFixture::new();
     f.vault.set_pool_cap(&500_000);

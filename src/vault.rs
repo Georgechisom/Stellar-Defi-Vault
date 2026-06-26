@@ -1,4 +1,4 @@
-use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Symbol, Vec};
 
 use crate::{
     admin, balance, errors::VaultError, events,
@@ -1665,6 +1665,28 @@ impl VaultContract {
         Ok(())
     }
 
+    /// Admin: set max active positions allowed per user (0 disables limit, max 10).
+    pub fn set_max_positions_per_user(
+        env: Env,
+        admin: Address,
+        max: u32,
+    ) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        let _ = admin;
+        if max > 10 {
+            return Err(VaultError::MaxPositionsTooHigh);
+        }
+        let key = Symbol::new(&env, "mxpos");
+        env.storage().instance().set(&key, &max);
+        Ok(())
+    }
+
+    /// Read-only: current max active positions allowed per user.
+    pub fn get_max_positions_per_user(env: Env) -> u32 {
+        let key = Symbol::new(&env, "mxpos");
+        env.storage().instance().get(&key).unwrap_or(0)
+    }
+
     /// Read-only: returns the current top stakers sorted descending by position size.
     pub fn get_leaderboard(env: Env) -> Result<Vec<LeaderboardEntry>, VaultError> {
         let _ = admin::get_admin(&env)?;
@@ -1867,6 +1889,18 @@ impl VaultContract {
         let total_shares = balance::get_total_shares(env);
         let total_deposited = balance::get_total_deposited(env);
         let current_shares = balance::get_shares(env, staker);
+
+        let max_positions: u32 = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(env, "mxpos"))
+            .unwrap_or(0);
+        if max_positions > 0 {
+            let current_positions = if current_shares > 0 { 1 } else { 0 };
+            if current_positions >= max_positions {
+                return Err(VaultError::MaxPositionsReached);
+            }
+        }
 
         Self::require_min_stake(env, current_shares, total_shares, total_deposited, amount)?;
         Self::accrue_rewards(env, staker, current_shares)?;
